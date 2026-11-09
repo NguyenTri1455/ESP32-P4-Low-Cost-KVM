@@ -1,6 +1,7 @@
 dependencies:
   espressif/usb_host_uvc: "^2.6.0"
   espressif/esp_tinyusb: "^2.0.0"
+  espressif/mdns: "^1.4.0"
   espressif/ip101:
     version: "^1.1.0"
     rules:

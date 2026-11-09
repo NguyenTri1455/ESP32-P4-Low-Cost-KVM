@@ -14,6 +14,7 @@
 #include "hid_device_mgr.h"
 #include "system_stats.h"
 #include "auth_mgr.h"
+#include "net_config_mgr.h"
 
 static const char *TAG = "app_main";
 
@@ -70,9 +71,10 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(ret);
 
-    // Initialize System Stats & Authentication subsystems
+    // Initialize System Stats, Auth, and Network Config subsystems
     system_stats_init();
     auth_mgr_init();
+    net_config_mgr_init();
 
     // 2. Report Memory
     size_t total_psram = heap_caps_get_total_size(MALLOC_CAP_SPIRAM);

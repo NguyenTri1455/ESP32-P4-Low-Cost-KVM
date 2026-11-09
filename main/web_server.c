@@ -19,6 +19,7 @@
 #include "hid_device_mgr.h"
 #include "system_stats.h"
 #include "auth_mgr.h"
+#include "net_config_mgr.h"
 #include "cJSON.h"
 #include "web_ui.h"
 #include "web_server.h"
@@ -739,6 +740,149 @@ static esp_err_t resolution_handler(httpd_req_t *req)
     return httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
 }
 
+static esp_err_t get_network_handler(httpd_req_t *req)
+{
+    net_config_t cfg;
+    net_config_mgr_get(&cfg);
+
+    const char *current_ip = ethernet_mgr_get_ip_str();
+
+    cJSON *root = cJSON_CreateObject();
+    if (!root) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+    cJSON_AddStringToObject(root, "status", "ok");
+    cJSON_AddBoolToObject(root, "dhcp_enabled", cfg.dhcp_enabled);
+    cJSON_AddStringToObject(root, "current_ip", current_ip);
+    cJSON_AddStringToObject(root, "static_ip", cfg.static_ip);
+    cJSON_AddStringToObject(root, "static_netmask", cfg.static_netmask);
+    cJSON_AddStringToObject(root, "static_gw", cfg.static_gw);
+    cJSON_AddStringToObject(root, "static_dns", cfg.static_dns);
+    cJSON_AddBoolToObject(root, "wifi_enabled", cfg.wifi_enabled);
+    cJSON_AddStringToObject(root, "wifi_ssid", cfg.wifi_ssid);
+    cJSON_AddBoolToObject(root, "wifi_pass_set", strlen(cfg.wifi_password) > 0);
+    cJSON_AddBoolToObject(root, "mdns_enabled", cfg.mdns_enabled);
+    cJSON_AddStringToObject(root, "mdns_hostname", cfg.mdns_hostname);
+
+    char *json_str = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+
+    if (!json_str) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    esp_err_t res = httpd_resp_send(req, json_str, HTTPD_RESP_USE_STRLEN);
+    free(json_str);
+    return res;
+}
+
+static esp_err_t post_network_handler(httpd_req_t *req)
+{
+    char buf[512];
+    int total_len = req->content_len;
+    if (total_len <= 0 || total_len >= sizeof(buf)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid request length");
+        return ESP_FAIL;
+    }
+
+    int received = httpd_req_recv(req, buf, total_len);
+    if (received <= 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Failed to read request body");
+        return ESP_FAIL;
+    }
+    buf[received] = '\0';
+
+    cJSON *root = cJSON_Parse(buf);
+    if (!root) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON");
+        return ESP_FAIL;
+    }
+
+    net_config_t cfg;
+    net_config_mgr_get(&cfg);
+
+    cJSON *item = cJSON_GetObjectItem(root, "dhcp_enabled");
+    if (item && cJSON_IsBool(item)) {
+        cfg.dhcp_enabled = cJSON_IsTrue(item);
+    }
+    item = cJSON_GetObjectItem(root, "static_ip");
+    if (item && cJSON_IsString(item) && strlen(item->valuestring) > 0) {
+        strncpy(cfg.static_ip, item->valuestring, sizeof(cfg.static_ip) - 1);
+        cfg.static_ip[sizeof(cfg.static_ip) - 1] = '\0';
+    }
+    item = cJSON_GetObjectItem(root, "static_netmask");
+    if (item && cJSON_IsString(item) && strlen(item->valuestring) > 0) {
+        strncpy(cfg.static_netmask, item->valuestring, sizeof(cfg.static_netmask) - 1);
+        cfg.static_netmask[sizeof(cfg.static_netmask) - 1] = '\0';
+    }
+    item = cJSON_GetObjectItem(root, "static_gw");
+    if (item && cJSON_IsString(item) && strlen(item->valuestring) > 0) {
+        strncpy(cfg.static_gw, item->valuestring, sizeof(cfg.static_gw) - 1);
+        cfg.static_gw[sizeof(cfg.static_gw) - 1] = '\0';
+    }
+    item = cJSON_GetObjectItem(root, "static_dns");
+    if (item && cJSON_IsString(item)) {
+        strncpy(cfg.static_dns, item->valuestring, sizeof(cfg.static_dns) - 1);
+        cfg.static_dns[sizeof(cfg.static_dns) - 1] = '\0';
+    }
+    item = cJSON_GetObjectItem(root, "wifi_enabled");
+    if (item && cJSON_IsBool(item)) {
+        cfg.wifi_enabled = cJSON_IsTrue(item);
+    }
+    item = cJSON_GetObjectItem(root, "wifi_ssid");
+    if (item && cJSON_IsString(item)) {
+        strncpy(cfg.wifi_ssid, item->valuestring, sizeof(cfg.wifi_ssid) - 1);
+        cfg.wifi_ssid[sizeof(cfg.wifi_ssid) - 1] = '\0';
+    }
+    item = cJSON_GetObjectItem(root, "wifi_password");
+    if (item && cJSON_IsString(item) && strlen(item->valuestring) > 0) {
+        strncpy(cfg.wifi_password, item->valuestring, sizeof(cfg.wifi_password) - 1);
+        cfg.wifi_password[sizeof(cfg.wifi_password) - 1] = '\0';
+    }
+    item = cJSON_GetObjectItem(root, "mdns_enabled");
+    if (item && cJSON_IsBool(item)) {
+        cfg.mdns_enabled = cJSON_IsTrue(item);
+    }
+    item = cJSON_GetObjectItem(root, "mdns_hostname");
+    if (item && cJSON_IsString(item) && strlen(item->valuestring) > 0) {
+        strncpy(cfg.mdns_hostname, item->valuestring, sizeof(cfg.mdns_hostname) - 1);
+        cfg.mdns_hostname[sizeof(cfg.mdns_hostname) - 1] = '\0';
+    }
+
+    bool reboot = false;
+    item = cJSON_GetObjectItem(root, "reboot");
+    if (item && cJSON_IsBool(item)) {
+        reboot = cJSON_IsTrue(item);
+    }
+
+    cJSON_Delete(root);
+
+    esp_err_t err = net_config_mgr_save(&cfg);
+    if (err != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to save settings");
+        return ESP_FAIL;
+    }
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    httpd_resp_send(req, "{\"status\":\"ok\",\"message\":\"Network settings saved\"}", HTTPD_RESP_USE_STRLEN);
+
+    if (reboot) {
+        ESP_LOGI(TAG, "Reboot requested after network configuration update. Rebooting in 1s...");
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        esp_restart();
+    } else {
+        // Dynamically re-apply mDNS
+        net_config_mgr_start_mdns();
+    }
+
+    return ESP_OK;
+}
+
 esp_err_t web_server_start(void)
 {
     if (s_http_server != NULL) {
@@ -750,7 +894,7 @@ esp_err_t web_server_start(void)
     config.server_port = 80;
     config.ctrl_port = 32768;
     config.max_open_sockets = 7;
-    config.max_uri_handlers = 16;
+    config.max_uri_handlers = 24;
     config.stack_size = 8192;
     config.lru_purge_enable = true;
     config.recv_wait_timeout = 30;
@@ -864,6 +1008,24 @@ esp_err_t web_server_start(void)
         .user_ctx  = NULL
     };
     REGISTER_URI(&uri_auth_status);
+
+    // Register /api/network (GET)
+    const httpd_uri_t uri_get_network = {
+        .uri       = "/api/network",
+        .method    = HTTP_GET,
+        .handler   = get_network_handler,
+        .user_ctx  = NULL
+    };
+    REGISTER_URI(&uri_get_network);
+
+    // Register /api/network (POST)
+    const httpd_uri_t uri_post_network = {
+        .uri       = "/api/network",
+        .method    = HTTP_POST,
+        .handler   = post_network_handler,
+        .user_ctx  = NULL
+    };
+    REGISTER_URI(&uri_post_network);
 
     // Register /ws
     const httpd_uri_t uri_ws = {

@@ -12,6 +12,7 @@ idf_component_register(
         "hid_device_mgr.c"
         "system_stats.c"
         "auth_mgr.c"
+        "net_config_mgr.c"
     INCLUDE_DIRS
         "."
     REQUIRES
@@ -29,5 +30,6 @@ idf_component_register(
         esp_ringbuf
         espressif__esp_tinyusb
         json
+        espressif__mdns
         ${EXTRA_REQUIRES}
 )

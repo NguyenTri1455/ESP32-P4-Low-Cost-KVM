@@ -12,6 +12,7 @@
 #endif
 
 #include "board_pins.h"
+#include "net_config_mgr.h"
 #include "ethernet_mgr.h"
 
 static const char *TAG = "eth_mgr";
@@ -34,6 +35,17 @@ static void eth_event_handler(void *arg, esp_event_base_t event_base,
         ESP_LOGI(TAG, "Ethernet HW Addr: %02x:%02x:%02x:%02x:%02x:%02x",
                  mac_addr[0], mac_addr[1], mac_addr[2],
                  mac_addr[3], mac_addr[4], mac_addr[5]);
+        {
+            net_config_t cfg;
+            net_config_mgr_get(&cfg);
+            if (!cfg.dhcp_enabled) {
+                strncpy(s_ip_str, cfg.static_ip, sizeof(s_ip_str) - 1);
+                s_ip_str[sizeof(s_ip_str) - 1] = '\0';
+                s_is_connected = true;
+                ESP_LOGI(TAG, "Static IP active: %s", s_ip_str);
+                net_config_mgr_start_mdns();
+            }
+        }
         break;
     case ETHERNET_EVENT_DISCONNECTED:
         ESP_LOGW(TAG, "Ethernet Link Down");
@@ -60,6 +72,9 @@ static void ip_event_handler(void *arg, esp_event_base_t event_base,
 
     snprintf(s_ip_str, sizeof(s_ip_str), IPSTR, IP2STR(&ip_info->ip));
     s_is_connected = true;
+
+    // Start mDNS responder once IP is acquired
+    net_config_mgr_start_mdns();
 
     ESP_LOGI(TAG, "===============================================");
     ESP_LOGI(TAG, "Ethernet Got IPv4: %s", s_ip_str);
@@ -148,6 +163,9 @@ esp_err_t ethernet_mgr_init(void)
 
     // 7. Attach Ethernet driver to TCP/IP stack
     ESP_ERROR_CHECK(esp_netif_attach(s_eth_netif, esp_eth_new_netif_glue(s_eth_handle)));
+
+    // 7b. Apply IP configuration (DHCP vs Static)
+    net_config_mgr_apply_eth(s_eth_netif);
 
     // 8. Register Event Handlers
     ESP_ERROR_CHECK(esp_event_handler_register(ETH_EVENT, ESP_EVENT_ANY_ID, &eth_event_handler, NULL));
