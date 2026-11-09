@@ -97,8 +97,8 @@ void app_main(void)
     ESP_LOGI(TAG, "Starting Web Display Server...");
     ESP_ERROR_CHECK(web_server_start());
 
-    // 7. Create background diagnostic monitor task
-    xTaskCreatePinnedToCore(monitor_task, "monitor_task", 4096, NULL, 5, NULL, 1);
+    // 7. Create background diagnostic monitor task on Core 0 (low-priority maintenance)
+    xTaskCreatePinnedToCore(monitor_task, "monitor_task", 4096, NULL, 1, NULL, 0);
 
     ESP_LOGI(TAG, "ESP32-P4 KVM Initialization complete! System is running.");
 }

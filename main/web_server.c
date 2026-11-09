@@ -376,8 +376,11 @@ static void mjpeg_stream_worker_task(void *pvParameters)
         size_t frame_len = 0;
 
         while (true) {
+            // Wait for a newly completed frame from UVC engine (event-driven, zero-latency wake up)
+            esp_err_t wait_err = uvc_stream_mgr_wait_for_frame(50);
+
             uint32_t current_frame_id = uvc_stream_mgr_get_frame_id();
-            if (current_frame_id != last_frame_id && current_frame_id != 0) {
+            if (wait_err == ESP_OK && current_frame_id != last_frame_id && current_frame_id != 0) {
                 esp_err_t err = uvc_stream_mgr_get_frame(&frame_buf, &frame_len, &last_frame_id);
                 if (err == ESP_OK && frame_buf != NULL && frame_len > 0) {
                     // Send multipart boundary
@@ -393,9 +396,6 @@ static void mjpeg_stream_worker_task(void *pvParameters)
                     res = httpd_resp_send_chunk(req, (const char *)frame_buf, frame_len);
                     if (res != ESP_OK) break;
                 }
-            } else {
-                // Wait 10ms for next frame
-                vTaskDelay(pdMS_TO_TICKS(10));
             }
 
             // Check if client disconnected
@@ -426,9 +426,9 @@ static esp_err_t stream_handler(httpd_req_t *req)
         "mjpeg_stream",
         8192,
         (void *)async_req,
-        4, // Worker priority
+        6, // Worker priority (Core 1)
         NULL,
-        1  // Pin to Core 1: leaves Core 0 completely free for HTTP server & networking
+        1  // Pin to Core 1: Video pipeline dedicated core
     );
 
     if (ret != pdPASS) {
@@ -581,8 +581,11 @@ esp_err_t web_server_start(void)
     config.lru_purge_enable = true;
     config.recv_wait_timeout = 30;
     config.send_wait_timeout = 30;
+    config.core_id = 0;           // Pin HTTP server & WebSocket listener to Core 0 (Network & Input core)
+    config.task_priority = 7;     // Priority 7 (high responsiveness for KVM input handling)
 
-    ESP_LOGI(TAG, "Starting HTTP server on port %d...", config.server_port);
+    ESP_LOGI(TAG, "Starting HTTP server on port %d (Core %d, Priority %d)...",
+             config.server_port, config.core_id, config.task_priority);
     esp_err_t err = httpd_start(&s_http_server, &config);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Failed to start HTTP server: %s", esp_err_to_name(err));
@@ -667,7 +670,7 @@ esp_err_t web_server_start(void)
         s_log_ringbuf = xRingbufferCreate(32768, RINGBUF_TYPE_NOSPLIT);
         if (s_log_ringbuf != NULL) {
             s_orig_vprintf = esp_log_set_vprintf(web_log_vprintf);
-            xTaskCreatePinnedToCore(ws_broadcast_task, "ws_broadcast", 4096, NULL, 5, &s_ws_task_handle, 0);
+            xTaskCreatePinnedToCore(ws_broadcast_task, "ws_broadcast", 4096, NULL, 4, &s_ws_task_handle, 0);
             ESP_LOGI(TAG, "WebSocket live log streamer and telemetry broadcaster active");
         }
     }

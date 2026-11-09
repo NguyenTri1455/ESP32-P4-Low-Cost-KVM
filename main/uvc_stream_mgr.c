@@ -4,6 +4,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
+#include "freertos/event_groups.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
@@ -15,9 +16,13 @@
 
 static const char *TAG = "uvc_mgr";
 
-#define USB_HOST_TASK_PRIORITY      20
+#define USB_HOST_TASK_PRIORITY      21
+#define UVC_DRIVER_TASK_PRIORITY    22
 #define UVC_STREAM_TASK_PRIORITY    19
 #define UVC_STALL_TIMEOUT_US        4000000ULL // 4.0 seconds without frames = stall
+#define UVC_FRAME_READY_BIT         (1 << 0)
+
+static EventGroupHandle_t s_frame_event_group = NULL;
 
 /* Frame buffer storage in PSRAM */
 static uint8_t *s_frame_buffers[2] = {NULL, NULL};
@@ -82,6 +87,17 @@ static bool frame_callback(const uvc_host_frame_t *frame, void *user_ctx)
         portEXIT_CRITICAL(&s_spinlock);
 
         update_fps_calc();
+
+        // Immediately notify waiting stream worker tasks on Core 1 (zero-latency wake up)
+        if (s_frame_event_group != NULL) {
+            if (xPortInIsrContext()) {
+                BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+                xEventGroupSetBitsFromISR(s_frame_event_group, UVC_FRAME_READY_BIT, &xHigherPriorityTaskWoken);
+                portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+            } else {
+                xEventGroupSetBits(s_frame_event_group, UVC_FRAME_READY_BIT);
+            }
+        }
     } else {
         ESP_LOGW(TAG, "Frame dropped: size %u exceeds buffer %u",
                  (unsigned)frame->data_len, (unsigned)BOARD_UVC_MAX_FRAME_SIZE);
@@ -232,6 +248,11 @@ esp_err_t uvc_stream_mgr_init(void)
     }
     ESP_LOGI(TAG, "PSRAM frame buffers allocated: [%p, %p]", s_frame_buffers[0], s_frame_buffers[1]);
 
+    // Create frame event group for zero-latency notification of stream workers
+    if (s_frame_event_group == NULL) {
+        s_frame_event_group = xEventGroupCreate();
+    }
+
     // 2. Install USB Host Core Driver
     ESP_LOGI(TAG, "Installing USB Host driver...");
     const usb_host_config_t host_config = {
@@ -244,7 +265,7 @@ esp_err_t uvc_stream_mgr_init(void)
         return err;
     }
 
-    // 3. Create USB library event task
+    // 3. Create USB library event task - Pinned to Core 1 (Dedicated Video Core)
     BaseType_t task_ret = xTaskCreatePinnedToCore(
         usb_lib_task,
         "usb_lib_task",
@@ -252,19 +273,19 @@ esp_err_t uvc_stream_mgr_init(void)
         NULL,
         USB_HOST_TASK_PRIORITY,
         NULL,
-        0
+        1 // Core 1
     );
     if (task_ret != pdPASS) {
         ESP_LOGE(TAG, "Failed to create usb_lib_task");
         return ESP_FAIL;
     }
 
-    // 4. Install UVC Class Driver
-    ESP_LOGI(TAG, "Installing UVC Host Class driver...");
+    // 4. Install UVC Class Driver - Pinned to Core 1 (Dedicated Video Core)
+    ESP_LOGI(TAG, "Installing UVC Host Class driver on Core 1...");
     const uvc_host_driver_config_t uvc_driver_config = {
         .driver_task_stack_size = 4096,
-        .driver_task_priority = USB_HOST_TASK_PRIORITY + 1,
-        .xCoreID = 0,
+        .driver_task_priority = UVC_DRIVER_TASK_PRIORITY,
+        .xCoreID = 1, // Core 1
         .create_background_task = true,
     };
     err = uvc_host_install(&uvc_driver_config);
@@ -273,7 +294,7 @@ esp_err_t uvc_stream_mgr_init(void)
         return err;
     }
 
-    // 5. Create UVC stream supervisor task
+    // 5. Create UVC stream supervisor task - Pinned to Core 1
     task_ret = xTaskCreatePinnedToCore(
         uvc_stream_task,
         "uvc_stream_task",
@@ -338,6 +359,24 @@ esp_err_t uvc_stream_mgr_get_frame(const uint8_t **out_buf, size_t *out_len, uin
 uint32_t uvc_stream_mgr_get_frame_id(void)
 {
     return s_latest_frame_id;
+}
+
+esp_err_t uvc_stream_mgr_wait_for_frame(uint32_t timeout_ms)
+{
+    if (s_frame_event_group == NULL) {
+        vTaskDelay(pdMS_TO_TICKS(timeout_ms));
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    EventBits_t bits = xEventGroupWaitBits(
+        s_frame_event_group,
+        UVC_FRAME_READY_BIT,
+        pdTRUE,          // Clear on exit
+        pdFALSE,         // Any bit
+        pdMS_TO_TICKS(timeout_ms)
+    );
+
+    return (bits & UVC_FRAME_READY_BIT) ? ESP_OK : ESP_ERR_TIMEOUT;
 }
 
 float uvc_stream_mgr_get_measured_fps(void)

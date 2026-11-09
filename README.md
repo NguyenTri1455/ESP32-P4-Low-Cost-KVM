@@ -160,18 +160,34 @@ CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
 
 ## 💻 Software Architecture
 
-### Core Task Partitioning
+### Core Task Partitioning (Dual-Core Optimization)
 
-The firmware leverages the dual-core RISC-V processor to prevent network streaming from starving USB communication or UI responsibilities:
+The firmware partitions workloads across the two 360MHz RISC-V cores to strictly separate real-time user input/networking from heavy continuous video data processing:
 
-| Core | Task Name | Priority | Responsibilities |
-| :--- | :--- | :--- | :--- |
-| **Core 0** | `tcpip_thread` | 18 | LWIP 100M network packet processing |
-| **Core 0** | `httpd` | 5 | HTTP REST endpoints, WebSocket listener, and JSON parser |
-| **Core 0** | `usb_host_lib` | 20 | USB Host UVC driver transfer daemon |
-| **Core 0** | `uvc_supervisor` | 4 | Video watchdog, frame stall detection, and auto-recovery |
-| **Core 0** | `tinyusb` | 5 | TinyUSB event processing and HID endpoint dispatch |
-| **Core 1** | `mjpeg_streamer` | 5 | Dedicated non-blocking multipart MJPEG frame transmitter |
+```
++------------------------------------+------------------------------------+
+|               CORE 0               |               CORE 1               |
+|   "Control, Network & KVM Input"   |     "Dedicated Video Pipeline"     |
++------------------------------------+------------------------------------+
+| - tcpip_thread (Priority 18)       | - uvc_driver_task (Priority 22)    |
+| - httpd / ws_handler (Priority 7)  | - usb_lib_task (Priority 21)       |
+| - TinyUSB HID Dispatcher (Core 0)  | - uvc_stream_task (Priority 19)    |
+| - ws_broadcast_task (Priority 4)   | - mjpeg_stream_worker (Priority 6) |
+| - monitor_task (Priority 1)        |   (Event-Driven, Zero Polling)     |
++------------------------------------+------------------------------------+
+```
+
+| Core | Task Name | Priority | Core Affinity | Responsibilities & Design Rationale |
+| :--- | :--- | :--- | :--- | :--- |
+| **Core 0** | `tcpip_thread` | 18 | `Pinned Core 0` | 100M Ethernet RMII EMAC packet processing, DMA queues, TCP ACK handling. |
+| **Core 0** | `httpd` | 7 | `Pinned Core 0` | Serves Web UI, REST endpoints, and processes 60 Hz WebSocket mouse/keyboard events. |
+| **Core 0** | `tinyusb` | Core Context | `Core 0` | Submits USB HID reports to target PC over USB-FS with sub-millisecond response. |
+| **Core 0** | `ws_broadcast` | 4 | `Pinned Core 0` | Drains log ringbuffer and broadcasts 1 Hz telemetry without preempting user inputs. |
+| **Core 0** | `monitor_task` | 1 | `Pinned Core 0` | Background diagnostics and memory stats every 5 seconds. |
+| **Core 1** | `uvc_driver_task`| 22 | `Pinned Core 1` | Ingests USB isochronous/bulk packets from UVC capture card. |
+| **Core 1** | `usb_lib_task` | 21 | `Pinned Core 1` | USB Host Library hardware event daemon for 480 Mbps USB-HS controller. |
+| **Core 1** | `uvc_stream_task`| 19 | `Pinned Core 1` | Capture supervisor, format negotiation, and 4-second frame stall watchdog. |
+| **Core 1** | `mjpeg_stream` | 6 | `Pinned Core 1` | **Event-Driven**: Sleeps with 0% CPU; unblocked in microseconds via `EventGroup` when a frame lands in PSRAM. |
 
 ### Memory & PSRAM Zero-Copy Double-Buffering
 

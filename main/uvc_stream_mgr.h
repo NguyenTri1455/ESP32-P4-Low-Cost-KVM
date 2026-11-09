@@ -61,6 +61,17 @@ esp_err_t uvc_stream_mgr_get_frame(const uint8_t **out_buf, size_t *out_len, uin
 uint32_t uvc_stream_mgr_get_frame_id(void);
 
 /**
+ * @brief Wait for a new frame to become ready in PSRAM (event-driven notification)
+ *
+ * Blocks the calling task until a new video frame completes capturing into PSRAM
+ * or until the timeout expires. Eliminates busy polling loops and reduces latency.
+ *
+ * @param timeout_ms Maximum time to wait in milliseconds
+ * @return ESP_OK if a new frame is ready, ESP_ERR_TIMEOUT on timeout.
+ */
+esp_err_t uvc_stream_mgr_wait_for_frame(uint32_t timeout_ms);
+
+/**
  * @brief Get the currently measured capture FPS
  *
  * @return float frames per second
