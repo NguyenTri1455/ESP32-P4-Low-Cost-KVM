@@ -1,0 +1,106 @@
+menu "JC-ESP32P4-M3-DEV KVM Configuration"
+
+    menu "Video Stream Configuration (USB to HDMI / UVC)"
+        choice UVC_FRAME_RESOLUTION
+            prompt "Target Video Resolution"
+            default UVC_RES_720P
+            help
+                Select the resolution requested from the USB-to-HDMI capture device.
+                Common capture dongles (MS2109, MS2130, etc.) support 720p and 1080p.
+
+            config UVC_RES_720P
+                bool "1280x720 (720p HD - Recommended)"
+            config UVC_RES_1080P
+                bool "1920x1080 (1080p Full HD)"
+            config UVC_RES_SVGA
+                bool "800x600 (SVGA)"
+            config UVC_RES_VGA
+                bool "640x480 (VGA - Fast / Low Bandwidth)"
+        endchoice
+
+        config UVC_FRAME_WIDTH
+            int
+            default 1280 if UVC_RES_720P
+            default 1920 if UVC_RES_1080P
+            default 800 if UVC_RES_SVGA
+            default 640 if UVC_RES_VGA
+
+        config UVC_FRAME_HEIGHT
+            int
+            default 720 if UVC_RES_720P
+            default 1080 if UVC_RES_1080P
+            default 600 if UVC_RES_SVGA
+            default 480 if UVC_RES_VGA
+
+        config UVC_FRAME_FPS
+            int "Video Stream Target FPS"
+            default 30
+            range 5 60
+            help
+                Frame rate negotiated with the USB-to-HDMI capture card.
+
+        config UVC_FRAME_BUFFER_SIZE_KB
+            int "Max Frame Buffer Size (KB in PSRAM)"
+            default 512
+            range 128 2048
+            help
+                Size allocated in PSRAM for holding a single compressed JPEG frame.
+                512KB is plenty for high quality 720p or 1080p JPEG.
+    endmenu
+
+    menu "Ethernet Hardware Configuration (IP101 PHY)"
+        config ETH_PHY_ADDR
+            int "Ethernet PHY Address"
+            default 1
+            range 0 31
+            help
+                SMI address of the onboard IP101 PHY chip (usually 1 on JC-ESP32P4-M3-DEV).
+
+        config ETH_MDC_GPIO
+            int "SMI MDC GPIO Pin"
+            default 31
+            help
+                ESP32-P4 GPIO connected to PHY MDC pin.
+
+        config ETH_MDIO_GPIO
+            int "SMI MDIO GPIO Pin"
+            default 52
+            help
+                ESP32-P4 GPIO connected to PHY MDIO pin.
+
+        config ETH_PWR_RST_GPIO
+            int "PHY Power / Reset GPIO Pin"
+            default 51
+            help
+                ESP32-P4 GPIO connected to PHY Power / Reset pin.
+
+        config ETH_RMII_CLK_GPIO
+            int "RMII Clock GPIO Pin"
+            default 50
+            help
+                ESP32-P4 GPIO connected to PHY 50MHz RMII clock.
+
+        config ETH_CLK_EXT_IN
+            bool "RMII Clock Input from PHY (External 50MHz)"
+            default y
+            help
+                When enabled, the 50MHz reference clock is provided by the PHY oscillator to GPIO 50.
+    endmenu
+
+    menu "Web Display Server Configuration"
+        config HTTP_SERVER_PORT
+            int "HTTP Web Server Port"
+            default 80
+            range 1 65535
+            help
+                TCP port for the web interface and MJPEG stream.
+
+        config HTTP_SERVER_MAX_CLIENTS
+            int "Max Concurrent HTTP Clients"
+            default 4
+            range 1 8
+            help
+                Maximum number of simultaneous browser / VLC connections.
+    endmenu
+
+endmenu
