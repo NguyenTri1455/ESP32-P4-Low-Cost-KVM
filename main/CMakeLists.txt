@@ -10,6 +10,8 @@ idf_component_register(
         "uvc_stream_mgr.c"
         "web_server.c"
         "hid_device_mgr.c"
+        "system_stats.c"
+        "auth_mgr.c"
     INCLUDE_DIRS
         "."
     REQUIRES

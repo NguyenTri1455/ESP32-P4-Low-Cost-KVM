@@ -12,6 +12,8 @@
 #include "uvc_stream_mgr.h"
 #include "web_server.h"
 #include "hid_device_mgr.h"
+#include "system_stats.h"
+#include "auth_mgr.h"
 
 static const char *TAG = "app_main";
 
@@ -60,13 +62,17 @@ void app_main(void)
     ESP_LOGI(TAG, " Board: %s", BOARD_NAME);
     ESP_LOGI(TAG, "=========================================================");
 
-    // 1. Initialize NVS (required for network stack)
+    // 1. Initialize NVS (required for network stack, auth, and configs)
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
         ret = nvs_flash_init();
     }
     ESP_ERROR_CHECK(ret);
+
+    // Initialize System Stats & Authentication subsystems
+    system_stats_init();
+    auth_mgr_init();
 
     // 2. Report Memory
     size_t total_psram = heap_caps_get_total_size(MALLOC_CAP_SPIRAM);

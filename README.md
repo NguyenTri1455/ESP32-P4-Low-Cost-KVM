@@ -275,22 +275,44 @@ All mouse, keyboard, macro, telemetry, and logging events pass through a single 
 | Endpoint | Method | Response Type | Description |
 | :--- | :--- | :--- | :--- |
 | `/` | `GET` | `text/html` | Glassmorphic Web KVM Single-Page Application |
-| `/stream` | `GET` | `multipart/x-mixed-replace` | Live MJPEG Video Stream (OBS / VLC / Web) |
+| `/stream` | `GET` | `multipart/x-mixed-replace` | Live MJPEG Video Stream (Strict single-client enforcement) |
 | `/snapshot` | `GET` | `image/jpeg` | Instant single-frame JPEG capture |
-| `/api/status` | `GET` | `application/json` | System health, FPS, UVC & HID status, memory stats |
+| `/api/status` | `GET` | `application/json` | System health, CPU0/CPU1 %, FPS, memory stats, net speed |
 | `/api/formats` | `GET` | `application/json` | List of resolutions supported by the capture card |
 | `/api/resolution` | `POST` | `application/json` | Set video stream resolution (`{"width": 1280, "height": 720, "fps": 30}`) |
 | `/api/reconnect_usb`| `POST` | `application/json` | Perform software-triggered USB UVC bus reset |
-| `/api/ota` | `POST` | `text/plain` | Dual-slot OTA binary upload and reboot |
-| `/ws` | `GET` | `WebSocket Upgrade` | Bidirectional KVM control, telemetry, and logs |
+| `/api/login` | `POST` | `application/json` | Authenticate user credentials & issue session token |
+| `/api/change_password`| `POST`| `application/json` | Update administrator password in persistent NVS |
+| `/api/auth_status` | `GET` | `application/json` | Check authentication status and administrator username |
+| `/api/ota` | `POST` | `application/json` | Dual-slot OTA binary upload and reboot |
+| `/ws` | `GET` | `WebSocket Upgrade` | Bidirectional KVM control, telemetry, and live serial logs |
+
+---
+
+## 🔒 Security & Single-Connection Policy
+
+To prevent network bandwidth saturation and guarantee exclusive remote access:
+* **Single Active Stream (`/stream`):** Only 1 client can consume the live video stream. Opening a new stream immediately supersedes and terminates any previous stream connection.
+* **Single Active KVM Session (`/ws`):** Only 1 active WebSocket control session is allowed. When a new user logs in, previous browser sessions are sent a `kicked` notification and cleanly disconnected.
+* **Administrator Authentication:** Persistent credentials stored in encrypted NVS namespace `kvm_auth`. Default credentials (`admin` / `admin`) can be updated dynamically via the Web UI.
+
+---
+
+## 📊 Live Performance & Diagnostics HUD (Zero Overhead)
+
+A built-in floating performance dialog provides real-time hardware telemetry updated at 1 Hz over WebSocket with **0% active CPU impact**:
+* **Core 0 & Core 1 CPU Load:** Derived from FreeRTOS idle task callbacks that only execute when a core is completely idle.
+* **Network Output Throughput:** Real-time transfer speed in Megabits per second (Mbps) and Kilobytes per second (KB/s).
+* **Hex-PSRAM & SRAM Heap Usage:** Live memory consumption, free space, and minimum allocation watermarks.
+* **Video & Device Status:** Live capture FPS, resolution, total captured frames, and USB HID connection state.
 
 ---
 
 ## 🔄 Dual-Slot OTA & Build System
 
-### Flash Partition Layout
+### Flash Partition Layout (16MB SPI Flash)
 
-The project defines a custom dual-slot layout in [`partitions.csv`](file:///c:/Users/nguye/Desktop/esp32p4_kvm/partitions.csv) inside the 16MB Flash:
+The project defines an expanded 16MB layout in [`partitions.csv`](file:///c:/Users/nguye/Desktop/esp32p4_kvm/partitions.csv) allocating up to **7.5 MB** per OTA slot:
 
 ```csv
 # Name,     Type,  SubType,  Offset,    Size,     Flags
@@ -298,8 +320,9 @@ nvs,        data,  nvs,      0x9000,    0x6000,
 otadata,    data,  ota,      0xf000,    0x2000,
 phy_init,   data,  phy,      0x11000,   0x1000,
 factory,    app,   factory,  0x20000,   0x100000,
-ota_0,      app,   ota_0,    0x120000,  0x400000,
-ota_1,      app,   ota_1,    0x520000,  0x400000,
+ota_0,      app,   ota_0,    0x120000,  0x700000,
+ota_1,      app,   ota_1,    0x820000,  0x780000,
+storage,    data,  spiffs,   0xfa0000,  0x60000,
 ```
 
 ### Building and Flashing with `Build.bat`

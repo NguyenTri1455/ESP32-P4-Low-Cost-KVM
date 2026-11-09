@@ -17,6 +17,8 @@
 #include "ethernet_mgr.h"
 #include "uvc_stream_mgr.h"
 #include "hid_device_mgr.h"
+#include "system_stats.h"
+#include "auth_mgr.h"
 #include "cJSON.h"
 #include "web_ui.h"
 #include "web_server.h"
@@ -28,13 +30,16 @@ static vprintf_like_t s_orig_vprintf = NULL;
 static volatile bool s_ws_sending = false;
 static TaskHandle_t s_ws_task_handle = NULL;
 
+/* Single-connection tracking: only 1 stream and 1 KVM session active */
+static volatile int s_active_stream_sock = -1;
+static volatile TaskHandle_t s_active_stream_task = NULL;
+static volatile int s_active_ws_fd = -1;
+
 static void get_telemetry_json(char *buf, size_t max_len)
 {
     uint32_t width = 0, height = 0, target_fps = 0, total_frames = 0;
     uvc_stream_mgr_get_stats(&width, &height, &target_fps, &total_frames);
 
-    size_t free_psram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
-    size_t free_sram = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
     float measured_fps = uvc_stream_mgr_get_measured_fps();
     bool is_streaming = uvc_stream_mgr_is_streaming();
     bool hid_mounted = hid_device_mgr_is_mounted();
@@ -42,10 +47,20 @@ static void get_telemetry_json(char *buf, size_t max_len)
     const char *ip = ethernet_mgr_get_ip_str();
     int64_t uptime_sec = esp_timer_get_time() / 1000000LL;
 
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    const char *partition_label = running ? running->label : "factory";
+    const esp_app_desc_t *app_desc = esp_app_get_description();
+
+    system_metrics_t m;
+    system_stats_get_metrics(&m);
+
     snprintf(buf, max_len,
              "{"
              "\"type\":\"telemetry\","
              "\"board\":\"%s\","
+             "\"partition\":\"%s\","
+             "\"version\":\"%s\","
+             "\"compiled\":\"%s %s\","
              "\"ip\":\"%s\","
              "\"uvc_connected\":%s,"
              "\"hid_mounted\":%s,"
@@ -55,10 +70,23 @@ static void get_telemetry_json(char *buf, size_t max_len)
              "\"target_fps\":%lu,"
              "\"total_frames\":%lu,"
              "\"uptime\":%lld,"
-             "\"free_psram\":%u,"
-             "\"free_sram\":%u"
+             "\"cpu0\":%.1f,"
+             "\"cpu1\":%.1f,"
+             "\"psram_total_kb\":%u,"
+             "\"psram_free_kb\":%u,"
+             "\"psram_used_kb\":%u,"
+             "\"psram_used_pct\":%.1f,"
+             "\"sram_total_kb\":%u,"
+             "\"sram_free_kb\":%u,"
+             "\"sram_min_free_kb\":%u,"
+             "\"sram_used_pct\":%.1f,"
+             "\"net_mbps\":%.2f,"
+             "\"net_kbps\":%.1f"
              "}",
              BOARD_NAME,
+             partition_label,
+             app_desc ? app_desc->version : "unknown",
+             app_desc ? app_desc->date : "", app_desc ? app_desc->time : "",
              ip,
              is_streaming ? "true" : "false",
              hid_mounted ? "true" : "false",
@@ -68,8 +96,18 @@ static void get_telemetry_json(char *buf, size_t max_len)
              (unsigned long)target_fps,
              (unsigned long)total_frames,
              (long long)uptime_sec,
-             (unsigned)free_psram,
-             (unsigned)free_sram);
+             m.cpu0_usage,
+             m.cpu1_usage,
+             (unsigned)m.psram_total_kb,
+             (unsigned)m.psram_free_kb,
+             (unsigned)m.psram_used_kb,
+             m.psram_used_pct,
+             (unsigned)m.sram_total_kb,
+             (unsigned)m.sram_free_kb,
+             (unsigned)m.sram_min_free_kb,
+             m.sram_used_pct,
+             m.net_tx_mbps,
+             m.net_tx_kbps);
 }
 
 static void broadcast_ws_msg(const char *msg)
@@ -92,6 +130,7 @@ static void broadcast_ws_msg(const char *msg)
     for (size_t i = 0; i < num_clients; i++) {
         if (httpd_ws_get_fd_info(s_http_server, client_fds[i]) == HTTPD_WS_CLIENT_WEBSOCKET) {
             httpd_ws_send_frame_async(s_http_server, client_fds[i], &ws_pkt);
+            system_stats_record_tx_bytes(ws_pkt.len);
         }
     }
     s_ws_sending = false;
@@ -176,7 +215,7 @@ static void ws_broadcast_task(void *pvParameter)
         int64_t now = esp_timer_get_time();
         if (now - last_telemetry_time >= 1000000LL) {
             last_telemetry_time = now;
-            char telem_buf[512];
+            char telem_buf[1024];
             get_telemetry_json(telem_buf, sizeof(telem_buf));
             broadcast_ws_msg(telem_buf);
         }
@@ -211,7 +250,7 @@ static esp_err_t snapshot_handler(httpd_req_t *req)
 
 static esp_err_t status_handler(httpd_req_t *req)
 {
-    char json_buf[512];
+    char json_buf[1024];
     get_telemetry_json(json_buf, sizeof(json_buf));
 
     httpd_resp_set_type(req, "application/json");
@@ -221,8 +260,8 @@ static esp_err_t status_handler(httpd_req_t *req)
 
 static void restart_task(void *pvParameter)
 {
-    ESP_LOGI(TAG, "Rebooting system in 1.5 seconds...");
-    vTaskDelay(pdMS_TO_TICKS(1500));
+    ESP_LOGI(TAG, "Rebooting system in 2.5 seconds...");
+    vTaskDelay(pdMS_TO_TICKS(2500));
     esp_restart();
 }
 
@@ -249,7 +288,7 @@ static esp_err_t ota_update_handler(httpd_req_t *req)
              (unsigned long)(update_partition->size / 1024), req->content_len);
 
     esp_ota_handle_t ota_handle = 0;
-    esp_err_t err = esp_ota_begin(update_partition, OTA_WITH_SEQUENTIAL_WRITES, &ota_handle);
+    esp_err_t err = esp_ota_begin(update_partition, req->content_len, &ota_handle);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "esp_ota_begin failed: %s", esp_err_to_name(err));
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OTA flash erase failed");
@@ -332,9 +371,10 @@ static esp_err_t ota_update_handler(httpd_req_t *req)
         return ESP_FAIL;
     }
 
-    ESP_LOGI(TAG, "OTA Successful! New active partition: '%s'. Restarting in 1.5s...", update_partition->label);
+    ESP_LOGI(TAG, "OTA Successful! New active partition: '%s'. Restarting in 2.5s...", update_partition->label);
 
     httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Connection", "close");
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
     httpd_resp_send(req, "{\"status\":\"ok\",\"message\":\"OTA update complete! Rebooting device into new firmware...\"}", HTTPD_RESP_USE_STRLEN);
 
@@ -361,11 +401,15 @@ static void mjpeg_stream_worker_task(void *pvParameters)
     ESP_LOGI(TAG, "[Core %d] Dedicated FreeRTOS MJPEG stream task started (sock %d)",
              xPortGetCoreID(), sockfd);
 
+    s_active_stream_sock = sockfd;
+    s_active_stream_task = xTaskGetCurrentTaskHandle();
+
     esp_err_t res = httpd_resp_set_type(req, "multipart/x-mixed-replace; boundary=ESP32P4_FRAME_BOUNDARY");
     if (res == ESP_OK) {
         httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
         httpd_resp_set_hdr(req, "Cache-Control", "no-cache, no-store, must-revalidate");
         httpd_resp_set_hdr(req, "Pragma", "no-cache");
+        httpd_resp_set_hdr(req, "Connection", "close");
 
         char part_buf[128];
         static const char *STREAM_BOUNDARY = "\r\n--ESP32P4_FRAME_BOUNDARY\r\n";
@@ -376,6 +420,12 @@ static void mjpeg_stream_worker_task(void *pvParameters)
         size_t frame_len = 0;
 
         while (true) {
+            // Enforce SINGLE-CONNECTION: Exit immediately if superseded by a newer stream connection
+            if (s_active_stream_sock != sockfd || httpd_req_to_sockfd(req) < 0) {
+                ESP_LOGI(TAG, "MJPEG stream on sock %d superseded by newer connection or closed", sockfd);
+                break;
+            }
+
             // Wait for a newly completed frame from UVC engine (event-driven, zero-latency wake up)
             esp_err_t wait_err = uvc_stream_mgr_wait_for_frame(50);
 
@@ -395,24 +445,45 @@ static void mjpeg_stream_worker_task(void *pvParameters)
                     // Send frame payload
                     res = httpd_resp_send_chunk(req, (const char *)frame_buf, frame_len);
                     if (res != ESP_OK) break;
+
+                    // Record bytes transmitted for zero-overhead live network throughput calculation
+                    system_stats_record_tx_bytes(strlen(STREAM_BOUNDARY) + hlen + frame_len);
                 }
             }
 
-            // Check if client disconnected
-            if (httpd_req_to_sockfd(req) < 0) {
+            // Check if client disconnected or superseded
+            if (s_active_stream_sock != sockfd || httpd_req_to_sockfd(req) < 0) {
                 break;
             }
         }
     }
 
-    ESP_LOGI(TAG, "MJPEG streaming client disconnected, freeing async FreeRTOS task");
+    ESP_LOGI(TAG, "MJPEG streaming client (sock %d) disconnected, freeing async FreeRTOS task", sockfd);
+    if (s_active_stream_sock == sockfd) {
+        s_active_stream_sock = -1;
+        s_active_stream_task = NULL;
+    }
     httpd_req_async_handler_complete(req);
     vTaskDelete(NULL);
 }
 
 static esp_err_t stream_handler(httpd_req_t *req)
 {
-    ESP_LOGI(TAG, "Incoming MJPEG stream request -> spawning dedicated FreeRTOS worker thread");
+    int new_sock = httpd_req_to_sockfd(req);
+    ESP_LOGI(TAG, "Incoming MJPEG stream request (sock %d)", new_sock);
+
+    // Enforce SINGLE-STREAM: Close previous stream session if one is currently active
+    if (s_active_stream_sock >= 0 && s_active_stream_sock != new_sock) {
+        ESP_LOGW(TAG, "New stream client (sock %d) -> closing previous stream (sock %d)",
+                 new_sock, s_active_stream_sock);
+        int old_sock = s_active_stream_sock;
+        s_active_stream_sock = -1; // Invalidate so previous task exits loop immediately
+        httpd_sess_trigger_close(s_http_server, old_sock);
+        if (s_active_stream_task != NULL) {
+            xTaskNotifyGive(s_active_stream_task);
+        }
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
 
     httpd_req_t *async_req = NULL;
     esp_err_t err = httpd_req_async_handler_begin(req, &async_req);
@@ -443,10 +514,39 @@ static esp_err_t stream_handler(httpd_req_t *req)
 
 static esp_err_t ws_handler(httpd_req_t *req)
 {
+    int sockfd = httpd_req_to_sockfd(req);
+
     if (req->method == HTTP_GET) {
-        ESP_LOGI(TAG, "WebSocket client handshake complete");
+        // Enforce SINGLE-CONNECTION: Disconnect previous active WebSocket session
+        if (s_active_ws_fd >= 0 && s_active_ws_fd != sockfd) {
+            ESP_LOGW(TAG, "New KVM session connected (fd %d) -> closing previous session (fd %d)",
+                     sockfd, s_active_ws_fd);
+            const char *kick_msg = "{\"type\":\"kicked\",\"msg\":\"Disconnected: Another user has connected to the KVM.\"}";
+            httpd_ws_frame_t kick_pkt = {
+                .final = true,
+                .fragmented = false,
+                .type = HTTPD_WS_TYPE_TEXT,
+                .payload = (uint8_t *)kick_msg,
+                .len = strlen(kick_msg)
+            };
+            httpd_ws_send_frame_async(s_http_server, s_active_ws_fd, &kick_pkt);
+            httpd_sess_trigger_close(s_http_server, s_active_ws_fd);
+        }
+        s_active_ws_fd = sockfd;
+        ESP_LOGI(TAG, "WebSocket client handshake complete (fd %d is active KVM session)", sockfd);
         return ESP_OK;
     }
+
+    // If no active session recorded or previous session closed, claim current socket
+    if (s_active_ws_fd < 0 || httpd_ws_get_fd_info(s_http_server, s_active_ws_fd) != HTTPD_WS_CLIENT_WEBSOCKET) {
+        s_active_ws_fd = sockfd;
+    }
+
+    // Only process input events from the active KVM session
+    if (sockfd != s_active_ws_fd) {
+        return ESP_OK;
+    }
+
     httpd_ws_frame_t ws_pkt;
     memset(&ws_pkt, 0, sizeof(httpd_ws_frame_t));
     ws_pkt.type = HTTPD_WS_TYPE_TEXT;
@@ -513,6 +613,97 @@ static esp_err_t ws_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+static esp_err_t login_handler(httpd_req_t *req)
+{
+    char buf[256];
+    int recved = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    if (recved <= 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Payload required");
+        return ESP_FAIL;
+    }
+    buf[recved] = '\0';
+
+    cJSON *root = cJSON_Parse(buf);
+    if (!root) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON");
+        return ESP_FAIL;
+    }
+
+    cJSON *u = cJSON_GetObjectItem(root, "username");
+    cJSON *p = cJSON_GetObjectItem(root, "password");
+    char safe_username[32] = {0};
+    if (u && cJSON_IsString(u) && u->valuestring) {
+        strncpy(safe_username, u->valuestring, sizeof(safe_username) - 1);
+    }
+    const char *password = (p && cJSON_IsString(p)) ? p->valuestring : "";
+
+    char token[AUTH_TOKEN_LEN];
+    esp_err_t err = auth_mgr_authenticate(safe_username, password, token, sizeof(token));
+    cJSON_Delete(root);
+
+    if (err == ESP_OK) {
+        char resp[256];
+        snprintf(resp, sizeof(resp), "{\"status\":\"ok\",\"token\":\"%s\",\"username\":\"%s\"}",
+                 token, safe_username);
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+        return httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
+    } else {
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_set_status(req, "401 Unauthorized");
+        httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+        return httpd_resp_send(req, "{\"status\":\"error\",\"message\":\"Invalid username or password\"}", HTTPD_RESP_USE_STRLEN);
+    }
+}
+
+static esp_err_t change_password_handler(httpd_req_t *req)
+{
+    char buf[256];
+    int recved = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    if (recved <= 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Payload required");
+        return ESP_FAIL;
+    }
+    buf[recved] = '\0';
+
+    cJSON *root = cJSON_Parse(buf);
+    if (!root) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON");
+        return ESP_FAIL;
+    }
+
+    cJSON *old_p = cJSON_GetObjectItem(root, "old_password");
+    cJSON *new_p = cJSON_GetObjectItem(root, "new_password");
+    const char *old_pass = (old_p && cJSON_IsString(old_p)) ? old_p->valuestring : "";
+    const char *new_pass = (new_p && cJSON_IsString(new_p)) ? new_p->valuestring : "";
+
+    esp_err_t err = auth_mgr_change_password(old_pass, new_pass);
+    cJSON_Delete(root);
+
+    if (err == ESP_OK) {
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+        return httpd_resp_send(req, "{\"status\":\"ok\",\"message\":\"Password changed successfully\"}", HTTPD_RESP_USE_STRLEN);
+    } else {
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+        return httpd_resp_send(req, "{\"status\":\"error\",\"message\":\"Current password incorrect or new password too short (min 4 chars)\"}", HTTPD_RESP_USE_STRLEN);
+    }
+}
+
+static esp_err_t auth_status_handler(httpd_req_t *req)
+{
+    char user[32];
+    auth_mgr_get_username(user, sizeof(user));
+
+    char resp[128];
+    snprintf(resp, sizeof(resp), "{\"status\":\"ok\",\"username\":\"%s\"}", user);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    return httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
+}
+
 static esp_err_t resolution_handler(httpd_req_t *req)
 {
     char buf[128];
@@ -577,6 +768,7 @@ esp_err_t web_server_start(void)
     config.server_port = 80;
     config.ctrl_port = 32768;
     config.max_open_sockets = 7;
+    config.max_uri_handlers = 16;
     config.stack_size = 8192;
     config.lru_purge_enable = true;
     config.recv_wait_timeout = 30;
@@ -584,13 +776,22 @@ esp_err_t web_server_start(void)
     config.core_id = 0;           // Pin HTTP server & WebSocket listener to Core 0 (Network & Input core)
     config.task_priority = 7;     // Priority 7 (high responsiveness for KVM input handling)
 
-    ESP_LOGI(TAG, "Starting HTTP server on port %d (Core %d, Priority %d)...",
-             config.server_port, config.core_id, config.task_priority);
+    ESP_LOGI(TAG, "Starting HTTP server on port %d (Core %d, Priority %d, Max URIs %d)...",
+             config.server_port, config.core_id, config.task_priority, config.max_uri_handlers);
     esp_err_t err = httpd_start(&s_http_server, &config);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Failed to start HTTP server: %s", esp_err_to_name(err));
         return err;
     }
+
+#define REGISTER_URI(u) do { \
+    esp_err_t _e = httpd_register_uri_handler(s_http_server, (u)); \
+    if (_e != ESP_OK) { \
+        ESP_LOGE(TAG, "FAILED to register URI %s: %s", (u)->uri, esp_err_to_name(_e)); \
+    } else { \
+        ESP_LOGD(TAG, "Registered URI %s", (u)->uri); \
+    } \
+} while (0)
 
     // Register /
     const httpd_uri_t uri_index = {
@@ -599,7 +800,7 @@ esp_err_t web_server_start(void)
         .handler   = index_handler,
         .user_ctx  = NULL
     };
-    httpd_register_uri_handler(s_http_server, &uri_index);
+    REGISTER_URI(&uri_index);
 
     // Register /stream
     const httpd_uri_t uri_stream = {
@@ -608,7 +809,7 @@ esp_err_t web_server_start(void)
         .handler   = stream_handler,
         .user_ctx  = NULL
     };
-    httpd_register_uri_handler(s_http_server, &uri_stream);
+    REGISTER_URI(&uri_stream);
 
     // Register /snapshot
     const httpd_uri_t uri_snapshot = {
@@ -617,7 +818,7 @@ esp_err_t web_server_start(void)
         .handler   = snapshot_handler,
         .user_ctx  = NULL
     };
-    httpd_register_uri_handler(s_http_server, &uri_snapshot);
+    REGISTER_URI(&uri_snapshot);
 
     // Register /api/status
     const httpd_uri_t uri_status = {
@@ -626,7 +827,7 @@ esp_err_t web_server_start(void)
         .handler   = status_handler,
         .user_ctx  = NULL
     };
-    httpd_register_uri_handler(s_http_server, &uri_status);
+    REGISTER_URI(&uri_status);
 
     // Register /api/reconnect_usb
     const httpd_uri_t uri_reconnect = {
@@ -635,7 +836,7 @@ esp_err_t web_server_start(void)
         .handler   = reconnect_usb_handler,
         .user_ctx  = NULL
     };
-    httpd_register_uri_handler(s_http_server, &uri_reconnect);
+    REGISTER_URI(&uri_reconnect);
 
     // Register /api/ota
     const httpd_uri_t uri_ota = {
@@ -644,7 +845,7 @@ esp_err_t web_server_start(void)
         .handler   = ota_update_handler,
         .user_ctx  = NULL
     };
-    httpd_register_uri_handler(s_http_server, &uri_ota);
+    REGISTER_URI(&uri_ota);
 
     // Register /api/resolution
     const httpd_uri_t uri_resolution = {
@@ -653,7 +854,34 @@ esp_err_t web_server_start(void)
         .handler   = resolution_handler,
         .user_ctx  = NULL
     };
-    httpd_register_uri_handler(s_http_server, &uri_resolution);
+    REGISTER_URI(&uri_resolution);
+
+    // Register /api/login
+    const httpd_uri_t uri_login = {
+        .uri       = "/api/login",
+        .method    = HTTP_POST,
+        .handler   = login_handler,
+        .user_ctx  = NULL
+    };
+    REGISTER_URI(&uri_login);
+
+    // Register /api/change_password
+    const httpd_uri_t uri_change_pwd = {
+        .uri       = "/api/change_password",
+        .method    = HTTP_POST,
+        .handler   = change_password_handler,
+        .user_ctx  = NULL
+    };
+    REGISTER_URI(&uri_change_pwd);
+
+    // Register /api/auth_status
+    const httpd_uri_t uri_auth_status = {
+        .uri       = "/api/auth_status",
+        .method    = HTTP_GET,
+        .handler   = auth_status_handler,
+        .user_ctx  = NULL
+    };
+    REGISTER_URI(&uri_auth_status);
 
     // Register /ws
     const httpd_uri_t uri_ws = {
@@ -663,7 +891,7 @@ esp_err_t web_server_start(void)
         .user_ctx     = NULL,
         .is_websocket = true
     };
-    httpd_register_uri_handler(s_http_server, &uri_ws);
+    REGISTER_URI(&uri_ws);
 
     // Initialize Log Ringbuffer and Interceptor
     if (s_log_ringbuf == NULL) {
