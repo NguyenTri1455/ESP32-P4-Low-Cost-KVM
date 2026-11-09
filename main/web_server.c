@@ -517,30 +517,12 @@ static esp_err_t ws_handler(httpd_req_t *req)
     int sockfd = httpd_req_to_sockfd(req);
 
     if (req->method == HTTP_GET) {
-        // Enforce SINGLE-CONNECTION: Disconnect previous active WebSocket session
-        if (s_active_ws_fd >= 0 && s_active_ws_fd != sockfd) {
-            ESP_LOGW(TAG, "New KVM session connected (fd %d) -> closing previous session (fd %d)",
-                     sockfd, s_active_ws_fd);
-            const char *kick_msg = "{\"type\":\"kicked\",\"msg\":\"Disconnected: Another user has connected to the KVM.\"}";
-            httpd_ws_frame_t kick_pkt = {
-                .final = true,
-                .fragmented = false,
-                .type = HTTPD_WS_TYPE_TEXT,
-                .payload = (uint8_t *)kick_msg,
-                .len = strlen(kick_msg)
-            };
-            httpd_ws_send_frame_async(s_http_server, s_active_ws_fd, &kick_pkt);
-            httpd_sess_trigger_close(s_http_server, s_active_ws_fd);
-        }
         s_active_ws_fd = sockfd;
-        ESP_LOGI(TAG, "WebSocket client handshake complete (fd %d is active KVM session)", sockfd);
+        ESP_LOGI(TAG, "WebSocket client connected (fd %d is active KVM session)", sockfd);
         return ESP_OK;
     }
 
-    // If no active session recorded or previous session closed, claim current socket
-    if (s_active_ws_fd < 0 || httpd_ws_get_fd_info(s_http_server, s_active_ws_fd) != HTTPD_WS_CLIENT_WEBSOCKET) {
-        s_active_ws_fd = sockfd;
-    }
+    s_active_ws_fd = sockfd;
 
     // Only process input events from the active KVM session
     if (sockfd != s_active_ws_fd) {
